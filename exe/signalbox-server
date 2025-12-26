@@ -1,0 +1,165 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "bundler/setup"
+require "signalbox"
+require "logger"
+require "optparse"
+
+# Parse command line arguments
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: signalbox-server [options]"
+
+  opts.on("--layout FILE", "Layout file to load (default: main.layout.rb)") do |file|
+    options[:layout] = file
+  end
+
+  opts.on("-l", "--logfile FILE", "Log file path (default: stdout)") do |file|
+    options[:logfile] = file
+  end
+
+  opts.on("--version", "Show version") do
+    puts "SignalBox version #{SignalBox::VERSION}"
+    exit
+  end
+
+  opts.on("-h", "--help", "Show this help message") do
+    puts opts
+    exit
+  end
+end.parse!
+
+LAYOUT_FILE = options[:layout] || "main.layout.rb"
+
+# Check if layout file exists
+unless File.exist?(LAYOUT_FILE)
+  puts "Error: Layout file '#{LAYOUT_FILE}' not found."
+  puts "Please specify a layout file using --layout option."
+  puts "Example: signalbox-server --layout path/to/layout.rb"
+  exit 1
+end
+
+SENSOR_PORT = ENV.fetch("SENSOR_PORT", "4040").to_i
+
+# Setup logger
+log_output = options[:logfile] ? options[:logfile] : STDOUT
+$logger = Logger.new(log_output)
+$logger.level = Logger::DEBUG
+
+$logger.info ""
+$logger.info "################################"
+$logger.info "SIGNALBOX SERVER STARTING"
+$logger.info "Version: #{SignalBox::VERSION}"
+
+# Load layout definition
+layout = SignalBox::LayoutLoader.load(LAYOUT_FILE, logger: $logger)
+
+# Get DCC connection from layout
+unless layout.dcc
+  $logger.error "Layout does not define a DCC controller."
+  $logger.error "Please add a 'dcc' block to your layout file."
+  puts "Error: Layout file must include a 'dcc' block defining the DCC controller."
+  puts "Example:"
+  puts "  dcc do"
+  puts "    host '192.168.0.22'"
+  puts "    port 2560"
+  puts "  end"
+  exit 1
+end
+
+dcc = layout.dcc
+
+# Mutex for thread-safe layout controller access
+layout_controller_mutex = Mutex.new
+
+layout_controller = SignalBox::LayoutController.new(
+  layout: layout,
+  dcc: dcc,
+  mutex: layout_controller_mutex,
+  logger: $logger
+)
+
+layout_controller.start
+
+# Initialize variables for shutdown handler
+control_loop_thread = nil
+server = nil
+
+# Graceful shutdown handler
+def shutdown(control_loop_thread, layout_controller, dcc, server, logger)
+  logger.info ""
+  logger.info "################################"
+  logger.info "SIGNALBOX SERVER SHUTTING DOWN"
+  logger.info "################################"
+
+  # Stop control loop
+  if control_loop_thread && control_loop_thread.alive?
+    logger.info "[SHUTDOWN] Stopping control loop..."
+    control_loop_thread.kill
+  end
+
+  # Emergency stop (turns off track power)
+  logger.info "[SHUTDOWN] Turning off track power..."
+  layout_controller.emergency_stop
+
+  # Close DCC connection
+  logger.info "[SHUTDOWN] Closing DCC connection..."
+  dcc.close
+
+  # Close TCP server
+  if server && !server.closed?
+    logger.info "[SHUTDOWN] Closing sensor server..."
+    server.close
+  end
+
+  logger.info "[SHUTDOWN] Shutdown complete"
+end
+
+# Set up signal trap to raise Interrupt
+Signal.trap("INT") { Thread.main.raise(Interrupt) }
+Signal.trap("TERM") { Thread.main.raise(Interrupt) }
+
+# 10 Hz control loop
+control_loop_thread = Thread.new do
+  last_tick_time = Time.now
+  $logger.info "[CONTROL LOOP] Starting 10 Hz control loop"
+
+  loop do
+    sleep(0.1)  # 10 Hz = 100ms interval
+
+    current_time = Time.now
+    elapsed_time = current_time - last_tick_time
+    last_tick_time = current_time
+
+    layout_controller_mutex.synchronize do
+      layout_controller.tick(elapsed_time)
+    end
+  end
+end
+control_loop_thread.abort_on_exception = true
+$logger.info "[CONTROL LOOP] Control loop thread started"
+
+HOST = "0.0.0.0"
+
+# Create sensor client handler
+sensor_handler = SignalBox::SensorClientHandler.new(
+  layout_controller: layout_controller,
+  mutex: layout_controller_mutex,
+  logger: $logger
+)
+
+server = TCPServer.new(HOST, SENSOR_PORT)
+$logger.info "Sensor server listening on #{HOST}:#{SENSOR_PORT}"
+
+begin
+  loop do
+    sock = server.accept
+
+    Thread.new(sock) do |client|
+      sensor_handler.handle_client(client)
+    end
+  end
+rescue Interrupt, SystemExit
+  shutdown(control_loop_thread, layout_controller, dcc, server, $logger)
+end

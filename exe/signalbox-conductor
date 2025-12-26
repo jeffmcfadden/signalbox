@@ -1,0 +1,210 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "bundler/setup"
+require "signalbox"
+require "logger"
+require "optparse"
+require "json"
+require "io/console"
+
+# Parse command line arguments
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: signalbox-conductor [options]"
+
+  opts.on("--version", "Show version") do
+    puts "SignalBox version #{SignalBox::VERSION}"
+    exit
+  end
+
+  opts.on("-h", "--help", "Show this help message") do
+    puts opts
+    exit
+  end
+end.parse!
+
+host = ARGV[0] || "localhost"
+port = 4040
+
+puts "Connecting to #{host}:#{port}..."
+socket = TCPSocket.new host, port
+puts "Connected!\n"
+
+# ANSI escape codes
+CLEAR_SCREEN = "\e[2J\e[H"
+BOLD = "\e[1m"
+RESET = "\e[0m"
+GREEN = "\e[32m"
+YELLOW = "\e[33m"
+BLUE = "\e[34m"
+CYAN = "\e[36m"
+
+def format_speed(speed)
+  sprintf("%.1f", speed)
+end
+
+def format_cab_status(cab, selected: false)
+  location = cab["location"] ? cab["location"]["name"] : "Unknown"
+  current = format_speed(cab["current_speed"])
+  target = cab["target_speed"]
+  direction = cab["direction_name"]
+
+  status_line = sprintf("%-20s | %-25s | Speed: %5s / %-3d | %s",
+    cab["name"],
+    location,
+    current,
+    target,
+    direction.capitalize
+  )
+
+  # Add selection indicator
+  if selected
+    status_line = "▶ #{status_line}"
+  else
+    status_line = "  #{status_line}"
+  end
+
+  # Color code based on speed status
+  if cab["current_speed"] < cab["target_speed"]
+    "#{GREEN}#{status_line}#{RESET}"
+  elsif cab["current_speed"] > cab["target_speed"]
+    "#{YELLOW}#{status_line}#{RESET}"
+  else
+    status_line
+  end
+end
+
+def read_nonblock_char
+  if IO.select([$stdin], nil, nil, 0)
+    c = $stdin.getch
+
+    # Handle arrow keys (escape sequences)
+    if c == "\e"
+      c2 = $stdin.getch
+      c3 = $stdin.getch
+      if c2 == "["
+        case c3
+        when "A" then return :up
+        when "B" then return :down
+        when "C" then return :right
+        when "D" then return :left
+        end
+      end
+    end
+
+    return c
+  end
+  nil
+end
+
+# Helper to print with proper line endings in raw mode
+def print_line(str = "")
+  print str + "\r\n"
+end
+
+# Set terminal to raw mode for keyboard input
+$stdin.raw!
+$stdin.echo = false
+
+selected_cab_index = 0
+last_status_time = Time.now
+data = nil
+
+begin
+  loop do
+    # Fetch status every second
+    if Time.now - last_status_time >= 1
+      socket.puts "STATUS"
+      response = socket.gets
+      last_status_time = Time.now
+
+      begin
+        data = JSON.parse(response)
+
+        # Clear screen and move cursor to top
+        print CLEAR_SCREEN
+
+        # Header
+        print_line "#{BOLD}#{BLUE}═══════════════════════════════════════════════════════════════════════════#{RESET}"
+        print_line "#{BOLD}#{BLUE}  SignalBox Conductor - Live Status Monitor#{RESET}"
+        print_line "#{BOLD}#{BLUE}═══════════════════════════════════════════════════════════════════════════#{RESET}"
+        print_line
+
+        # Layout info
+        print_line "#{BOLD}Layout:#{RESET} #{data["layout"]["name"]}"
+        print_line
+
+        # Cabs header
+        print_line "#{BOLD}#{CYAN}Cabs:#{RESET}"
+        print_line "#{'-' * 79}"
+
+        if data["cabs"].empty?
+          print_line "  No cabs configured"
+        else
+          # Ensure selected index is valid
+          selected_cab_index = 0 if selected_cab_index >= data["cabs"].length
+          selected_cab_index = data["cabs"].length - 1 if selected_cab_index < 0
+
+          data["cabs"].each_with_index do |cab, idx|
+            print_line format_cab_status(cab, selected: idx == selected_cab_index)
+          end
+        end
+
+        print_line
+        print_line "#{'-' * 79}"
+        print_line "#{GREEN}●#{RESET} Accelerating  #{YELLOW}●#{RESET} Decelerating  ⚪ At target speed"
+        print_line
+        print_line "Controls: ↑/↓ Adjust speed  ←/→ Select cab  X Stop  Q/Ctrl+C Exit"
+
+      rescue JSON::ParserError => e
+        print_line "#{YELLOW}Warning: Failed to parse response#{RESET}"
+      end
+    end
+
+    # Check for keyboard input
+    key = read_nonblock_char
+
+    if key && data && !data["cabs"].empty?
+      selected_cab = data["cabs"][selected_cab_index]
+
+      case key
+      when :up
+        # Increase target speed
+        new_speed = selected_cab["target_speed"] + 1
+        socket.puts "SET_TARGET_SPEED #{selected_cab["address"]} #{new_speed}"
+        socket.gets # Read OK/ERROR response
+
+      when :down
+        # Decrease target speed
+        new_speed = [selected_cab["target_speed"] - 1, 0].max
+        socket.puts "SET_TARGET_SPEED #{selected_cab["address"]} #{new_speed}"
+        socket.gets # Read OK/ERROR response
+
+      when :left
+        # Select previous cab
+        selected_cab_index = (selected_cab_index - 1) % data["cabs"].length
+
+      when :right
+        # Select next cab
+        selected_cab_index = (selected_cab_index + 1) % data["cabs"].length
+
+      when "x", "X"
+        # Stop cab (set target speed to 0)
+        socket.puts "SET_TARGET_SPEED #{selected_cab["address"]} 0"
+        socket.gets # Read OK/ERROR response
+
+      when "\u0003", "q", "Q" # Ctrl+C or 'q'/'Q'
+        break
+      end
+    end
+
+    sleep 0.05 # Small sleep to reduce CPU usage
+  end
+ensure
+  # Restore terminal settings
+  $stdin.cooked!
+  $stdin.echo = true
+  puts "\nExiting..."
+end
+
