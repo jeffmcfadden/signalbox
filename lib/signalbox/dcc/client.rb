@@ -1,9 +1,13 @@
 require 'socket'
+require 'logger'
 
 module SignalBox
   module DCC
+    
+    # DCC Client for communicating with a DCC command station over TCP
+    # Canonical target is DCC-EX command station
     class Client
-      def initialize(host, port, logger:)
+      def initialize(host, port, logger: Logger.new(STDOUT))
         @host = host
         @port = port
         @logger = logger

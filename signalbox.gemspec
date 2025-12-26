@@ -8,7 +8,7 @@ Gem::Specification.new do |spec|
   spec.description   = "SignalBox is a distributed control system for DCC model railroads. " \
                        "It provides a Ruby-based server that receives sensor events from ESP32 nodes, " \
                        "applies control logic, and sends DCC-EX commands to control trains."
-  spec.homepage      = ""
+  spec.homepage      = "https://github.com/jeffmcfadden/signalbox"
   spec.license       = "MIT"
   spec.required_ruby_version = ">= 3.0.0"
 
